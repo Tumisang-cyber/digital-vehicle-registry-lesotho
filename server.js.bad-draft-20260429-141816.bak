@@ -1,0 +1,917 @@
+require("dotenv").config();
+const express    = require("express");
+const cors       = require("cors");
+const helmet     = require("helmet");
+const morgan     = require("morgan");
+const crypto     = require("crypto");
+const axios      = require("axios");
+const jwt        = require("jsonwebtoken");
+const fs         = require("fs");
+const { Pool }   = require("pg");
+
+const app  = express();
+const PORT = process.env.PORT || 5000;
+
+// ─── Database ────────────────────────────────────────────────
+const db = new Pool({
+  host:     process.env.DB_HOST     || "127.0.0.1",
+  port:     parseInt(process.env.DB_PORT || "5432"),
+  database: process.env.DB_NAME     || "dvrs_db",
+  user:     process.env.DB_USER     || "dvrs_user",
+  password: process.env.DB_PASSWORD || "dvrs_pass",
+});
+
+db.connect()
+  .then(() => console.log("✅ PostgreSQL connected"))
+  .catch(err => console.error("❌ PostgreSQL error:", err.message));
+
+// ─── Middleware ──────────────────────────────────────────────
+app.use(helmet());
+app.use(cors({ origin: process.env.FRONTEND_URL || "http://0.0.0.0:3001", credentials: true }));
+app.use(morgan("dev"));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Prevent browser caching of API responses
+app.use((req, res, next) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  next();
+});
+
+// ─── Auth Middleware ─────────────────────────────────────────
+const authenticate = (req, res, next) => {
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith("Bearer ")) {
+    return res.status(401).json({ success: false, error: "No token provided" });
+  }
+  try {
+    const token = auth.split(" ")[1];
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || "dvrs-lesotho-jwt-secret-2026");
+    req.user = decoded;
+    next();
+  } catch (err) {
+    return res.status(401).json({ success: false, error: "Invalid token" });
+  }
+};
+
+// ─── Audit Logger ────────────────────────────────────────────
+async function audit(action, actorId, actorRole, entityType, entityId, details, ip) {
+  try {
+    await db.query(
+      `INSERT INTO audit_logs (action, actor_id, actor_role, entity_type, entity_id, details, ip_address)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [action, actorId, actorRole, entityType, entityId, JSON.stringify(details), ip || null]
+    );
+  } catch (e) {
+    console.error("Audit log error:", e.message);
+  }
+}
+
+// ─── Fee Calculator ──────────────────────────────────────────
+function calculateFee(weightKg) {
+  const w = parseInt(weightKg) || 0;
+  if (w <= 1500)  return 150.00;
+  if (w <= 3500)  return 250.00;
+  if (w <= 6500)  return 350.00;
+  if (w <= 9500)  return 400.00;
+  if (w <= 11000) return 310.00;
+  return 360.00;
+}
+
+// ─── X-Road Real Services ─────────────────────────────────────
+const XROAD_SS_URL  = "http://192.168.43.34:8080";
+const XROAD_CLIENT  = "TEST/GOV/MOT001/VehicleRegistry";
+const XROAD_SERVICE = "TEST/GOV/MOT001/VehicleRegistry/dvrs";
+
+async function requestXRoadClearance(type, params) {
+  const endpoints = {
+    cid:      "/api/clearance/cid",
+    interpol: "/api/clearance/interpol",
+    lra:      "/api/clearance/lra"
+  };
+  const url = XROAD_SS_URL + "/r1/" + XROAD_SERVICE + endpoints[type];
+  try {
+    const response = await axios.post(url, params, {
+      headers: { "X-Road-Client": XROAD_CLIENT, "Content-Type": "application/json" },
+      timeout: 30000
+    });
+    const data = response.data;
+    return {
+      status:      data.status || "CLEAR",
+      signedToken: data.signedToken || jwt.sign({ type, status: "CLEAR", params, iss: "TEST/GOV/" + type.toUpperCase() }, "xroad-secret", { expiresIn: "1h" }),
+      issuedBy:    data.issuedBy || "TEST/GOV/" + type.toUpperCase() + "/XRoad/SS1",
+      receivedAt:  new Date().toISOString(),
+    };
+  } catch (err) {
+    console.warn("X-Road " + type + " failed, using fallback:", err.message);
+    const delays = { cid: 1500, interpol: 2500, lra: 2000 };
+    await new Promise(r => setTimeout(r, delays[type] || 1500));
+    return {
+      status:      "CLEAR",
+      signedToken: jwt.sign({ type, status: "CLEAR", params, iss: "TEST/GOV/" + type.toUpperCase() }, "xroad-mock-secret", { expiresIn: "1h" }),
+      issuedBy:    "TEST/GOV/" + type.toUpperCase() + "/MockFallback",
+      receivedAt:  new Date().toISOString(),
+    };
+  }
+}
+
+// ══════════════════════════════════════════════════════════════
+// HEALTH CHECK
+// ══════════════════════════════════════════════════════════════
+app.get("/api/health", async (req, res) => {
+  let dbStatus = "disconnected";
+  try { await db.query("SELECT 1"); dbStatus = "connected"; } catch {}
+  res.json({ status: "ok", service: "DVRS Backend", database: dbStatus, timestamp: new Date().toISOString() });
+});
+
+// ══════════════════════════════════════════════════════════════
+// MOSIP AUTH ROUTES
+// ══════════════════════════════════════════════════════════════
+const pendingStates = new Map();
+const privateKey = fs.existsSync(process.env.MOSIP_PRIVATE_KEY_PATH || "./dvrs-private.pem")
+  ? fs.readFileSync(process.env.MOSIP_PRIVATE_KEY_PATH || "./dvrs-private.pem", "utf8")
+  : null;
+
+app.get("/api/auth/mosip/discover", async (req, res) => {
+  try {
+    const r = await axios.get(`${process.env.MOSIP_ESIGNET_BASE_URL}/v1/esignet/oidc/.well-known/openid-configuration`);
+    res.json({ success: true, endpoints: r.data });
+  } catch (e) { res.status(503).json({ success: false, error: e.message }); }
+});
+
+app.get("/api/auth/mosip/login", (req, res) => {
+  const state = crypto.randomBytes(16).toString("hex");
+  const nonce = crypto.randomBytes(16).toString("hex");
+  pendingStates.set(state, { nonce, expiresAt: Date.now() + 10 * 60 * 1000 });
+
+  const params = new URLSearchParams({
+    response_type: "code", client_id: process.env.MOSIP_CLIENT_ID,
+    redirect_uri: process.env.MOSIP_REDIRECT_URI, scope: "openid profile",
+    state, nonce, acr_values: "mosip:idp:acr:static-code",
+  });
+
+  const authUrl = `${process.env.MOSIP_ESIGNET_BASE_URL}/authorize?${params.toString()}`;
+  res.json({ success: true, authUrl, state });
+});
+
+app.get("/api/auth/mosip/callback", async (req, res) => {
+  const { code, state, error, error_description } = req.query;
+  if (error) return res.redirect(`${process.env.FRONTEND_URL}/login?error=${encodeURIComponent(error_description || error)}`);
+
+  let nonce = "testnonce123";
+  if (pendingStates.has(state)) { nonce = pendingStates.get(state).nonce; pendingStates.delete(state); }
+  if (!code) return res.redirect(`${process.env.FRONTEND_URL}/login?error=no_code`);
+
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    const clientAssertion = jwt.sign(
+      { iss: process.env.MOSIP_CLIENT_ID, sub: process.env.MOSIP_CLIENT_ID,
+        aud: process.env.MOSIP_TOKEN_ENDPOINT, jti: crypto.randomBytes(8).toString("hex"), iat: now, exp: now + 300 },
+      privateKey, { algorithm: "RS256" }
+    );
+
+    const tokenRes = await axios.post(
+      process.env.MOSIP_TOKEN_ENDPOINT,
+      new URLSearchParams({
+        grant_type: "authorization_code", code,
+        redirect_uri: process.env.MOSIP_REDIRECT_URI,
+        client_id: process.env.MOSIP_CLIENT_ID,
+        client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+        client_assertion: clientAssertion,
+      }),
+      { headers: { "Content-Type": "application/x-www-form-urlencoded" }, timeout: 15000 }
+    );
+
+    const { id_token } = tokenRes.data;
+    const decoded = jwt.decode(id_token);
+    console.log("✅ MOSIP auth success:", decoded.sub);
+
+    // Upsert citizen in database
+    const citizenResult = await db.query(
+      `INSERT INTO citizens (national_id, full_name, email)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (national_id) DO UPDATE SET full_name = EXCLUDED.full_name
+       RETURNING citizen_id`,
+      [decoded.sub, decoded.name || "Citizen", decoded.email || null]
+    );
+
+    const citizenId = citizenResult.rows[0].citizen_id;
+
+    await audit("MOSIP_AUTH_SUCCESS", decoded.sub, "CITIZEN", "citizen", citizenId, { sub: decoded.sub }, req.ip);
+
+    const sessionToken = jwt.sign(
+      { nationalId: decoded.sub, citizenId, name: decoded.name || "Citizen", role: "CITIZEN" },
+      process.env.JWT_SECRET,
+      { expiresIn: "8h" }
+    );
+
+    res.redirect(`${process.env.FRONTEND_URL}/auth/success?token=${sessionToken}&nationalId=${decoded.sub}`);
+  } catch (err) {
+    console.error("❌ MOSIP callback error:", err.response?.data || err.message);
+    res.redirect(`${process.env.FRONTEND_URL}/login?error=${encodeURIComponent(err.message)}`);
+  }
+});
+
+app.post("/api/auth/logout", authenticate, (req, res) => {
+  res.json({ success: true, message: "Logged out" });
+});
+
+// ══════════════════════════════════════════════════════════════
+// VEHICLE ROUTES
+// ══════════════════════════════════════════════════════════════
+app.get("/api/vehicles", authenticate, async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT v.*, o.owner_id, c.full_name as owner_name,
+              r.registration_number, r.status as reg_status, r.expiry_date
+       FROM vehicles v
+       LEFT JOIN ownership o ON o.vehicle_id = v.vehicle_id AND o.end_date IS NULL
+       LEFT JOIN citizens c ON c.citizen_id = o.owner_id
+       LEFT JOIN registrations r ON r.vehicle_id = v.vehicle_id AND r.status = 'APPROVED'
+       WHERE o.owner_id = (SELECT citizen_id FROM citizens WHERE national_id = $1)
+       ORDER BY v.created_at DESC`,
+      [req.user.nationalId]
+    );
+    res.json({ success: true, vehicles: result.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+// REGISTRATION ROUTES
+// ══════════════════════════════════════════════════════════════
+app.post("/api/registrations", authenticate, async (req, res) => {
+  const { vehicleDetails, category } = req.body;
+  const { citizenId, nationalId } = req.user;
+
+  try {
+    // 1. Create vehicle record
+    const vehicleResult = await db.query(
+      `INSERT INTO vehicles (vin, engine_number, chassis_number, vehicle_type, manufacturer, model, manufacture_year, tare_weight_kg, color)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING vehicle_id`,
+      [vehicleDetails.vin, vehicleDetails.engineNumber, vehicleDetails.chassis,
+       vehicleDetails.vehicleType, vehicleDetails.make?.split(" ")[0],
+       vehicleDetails.make, parseInt(vehicleDetails.year), parseInt(vehicleDetails.weight), vehicleDetails.color]
+    );
+    const vehicleId = vehicleResult.rows[0].vehicle_id;
+
+    // 2. Calculate fee
+    const fee = calculateFee(vehicleDetails.weight);
+
+    // 3. Create registration record
+    const regResult = await db.query(
+      `INSERT INTO registrations (vehicle_id, owner_id, registration_category, fee_amount, status)
+       VALUES ($1, $2, $3, $4, 'PENDING') RETURNING registration_id`,
+      [vehicleId, citizenId, category, fee]
+    );
+    const registrationId = regResult.rows[0].registration_id;
+    // 4. Create ownership record
+    await db.query(
+      `INSERT INTO ownership (vehicle_id, owner_id, start_date, transfer_type, status) VALUES ($1, $2, NOW(), 'PURCHASE', 'PENDING')`,
+      [vehicleId, citizenId]
+    );
+
+    // 5. Create pending clearance records
+    for (const type of ["CID", "INTERPOL", "LRA"]) {
+      await db.query(
+        `INSERT INTO clearances (registration_id, clearance_type, status) VALUES ($1, $2, 'PENDING')`,
+        [registrationId, type]
+      );
+    }
+
+    await audit("REGISTRATION_SUBMITTED", nationalId, "CITIZEN", "registration", registrationId, { category, fee }, req.ip);
+
+    // 6. Trigger X-Road clearances in background
+    triggerClearances(registrationId, vehicleId, citizenId, nationalId, vehicleDetails);
+
+    res.json({ success: true, registrationId, vehicleId, fee, status: "PENDING",
+               message: "Registration submitted. X-Road clearances initiated." });
+  } catch (err) {
+    console.error("Registration error:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Background clearance processing
+async function triggerClearances(registrationId, vehicleId, citizenId, nationalId, vehicleDetails) {
+  try {
+    // CID clearance
+    const cidResult = await requestXRoadClearance("cid", { nationalId });
+    await db.query(
+      `UPDATE clearances SET status=$1, signed_token=$2, issued_by=$3, received_at=NOW()
+       WHERE registration_id=$4 AND clearance_type='CID'`,
+      [cidResult.status, cidResult.signedToken, cidResult.issuedBy, registrationId]
+    );
+    await audit("CLEARANCE_RECEIVED", "XROAD/CID", "SYSTEM", "clearance", registrationId, { type: "CID", status: cidResult.status }, null);
+
+    // Interpol clearance
+    const interpolResult = await requestXRoadClearance("interpol", { vin: vehicleDetails.vin, engineNumber: vehicleDetails.engineNumber });
+    await db.query(
+      `UPDATE clearances SET status=$1, signed_token=$2, issued_by=$3, received_at=NOW()
+       WHERE registration_id=$4 AND clearance_type='INTERPOL'`,
+      [interpolResult.status, interpolResult.signedToken, interpolResult.issuedBy, registrationId]
+    );
+    await audit("CLEARANCE_RECEIVED", "XROAD/INTERPOL", "SYSTEM", "clearance", registrationId, { type: "INTERPOL", status: interpolResult.status }, null);
+
+    // LRA clearance
+    const lraResult = await requestXRoadClearance("lra", { nationalId });
+    await db.query(
+      `UPDATE clearances SET status=$1, signed_token=$2, issued_by=$3, received_at=NOW()
+       WHERE registration_id=$4 AND clearance_type='LRA'`,
+      [lraResult.status, lraResult.signedToken, lraResult.issuedBy, registrationId]
+    );
+    await audit("CLEARANCE_RECEIVED", "XROAD/LRA", "SYSTEM", "clearance", registrationId, { type: "LRA", status: lraResult.status }, null);
+
+    // Update registration to AWAITING_REVIEW
+    await db.query(`UPDATE registrations SET status='AWAITING_REVIEW', updated_at=NOW() WHERE registration_id=$1`, [registrationId]);
+    console.log(`✅ All clearances complete for registration ${registrationId}`);
+  } catch (err) {
+    console.error("Clearance error:", err.message);
+    await db.query(`UPDATE registrations SET status='CLEARANCE_FAILED', updated_at=NOW() WHERE registration_id=$1`, [registrationId]);
+  }
+}
+
+app.get("/api/registrations", authenticate, async (req, res) => {
+  try {
+    const isOfficer = req.user.role === "OFFICER";
+    const query = isOfficer
+      ? `SELECT r.*, v.vin, v.manufacturer, v.model, v.tare_weight_kg, c.full_name as owner_name, c.national_id,
+                json_agg(json_build_object('type', cl.clearance_type, 'status', cl.status, 'received_at', cl.received_at)) as clearances
+         FROM registrations r
+         JOIN vehicles v ON v.vehicle_id = r.vehicle_id
+         JOIN citizens c ON c.citizen_id = r.owner_id
+         LEFT JOIN clearances cl ON cl.registration_id = r.registration_id
+         GROUP BY r.registration_id, v.vehicle_id, c.citizen_id
+         ORDER BY r.created_at DESC`
+      : `SELECT r.*, v.vin, v.manufacturer, v.model, v.tare_weight_kg,
+                json_agg(json_build_object('type', cl.clearance_type, 'status', cl.status)) as clearances
+         FROM registrations r
+         JOIN vehicles v ON v.vehicle_id = r.vehicle_id
+         JOIN citizens c ON c.citizen_id = r.owner_id
+         LEFT JOIN clearances cl ON cl.registration_id = r.registration_id
+         WHERE c.national_id = $1
+         GROUP BY r.registration_id, v.vehicle_id
+         ORDER BY r.created_at DESC`;
+
+    const result = isOfficer
+      ? await db.query(query)
+      : await db.query(query, [req.user.nationalId]);
+
+    res.json({ success: true, registrations: result.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+
+app.get("/api/registrations/:id", authenticate, async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT r.*, v.*, c.full_name as owner_name, c.national_id,
+              json_agg(DISTINCT jsonb_build_object('type', cl.clearance_type, 'status', cl.status, 'issued_by', cl.issued_by, 'received_at', cl.received_at)) as clearances
+       FROM registrations r
+       JOIN vehicles v ON v.vehicle_id = r.vehicle_id
+       JOIN citizens c ON c.citizen_id = r.owner_id
+       LEFT JOIN clearances cl ON cl.registration_id = r.registration_id
+       WHERE r.registration_id = $1
+       GROUP BY r.registration_id, v.vehicle_id, c.citizen_id`,
+      [req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ success: false, error: "Not found" });
+    res.json({ success: true, registration: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Officer approve
+app.patch("/api/registrations/:id/approve", authenticate, async (req, res) => {
+  if (req.user.role !== "OFFICER") return res.status(403).json({ success: false, error: "Officers only" });
+
+  try {
+    const regNum = "A " + Math.floor(1000 + Math.random() * 9000) + " LS";
+    const expiryDate = new Date();
+    expiryDate.setFullYear(expiryDate.getFullYear() + 1);
+
+    await db.query(
+      `UPDATE registrations SET status='APPROVED', registration_number=$1,
+       registration_date=NOW(), expiry_date=$2, updated_at=NOW()
+       WHERE registration_id=$3`,
+      [regNum, expiryDate.toISOString().split("T")[0], req.params.id]
+    );
+
+    // Create ownership record for the new owner
+    await db.query(
+      `INSERT INTO ownership (vehicle_id, owner_id, start_date, status)
+       SELECT r.vehicle_id, r.owner_id, NOW(), 'APPROVED'
+       FROM registrations r
+       WHERE r.registration_id = $1
+       ON CONFLICT DO NOTHING`,
+      [req.params.id]
+    );
+    await audit("REGISTRATION_APPROVED", req.user.nationalId, "OFFICER", "registration", req.params.id, { registrationNumber: regNum }, req.ip);
+
+    res.json({ success: true, registrationNumber: regNum, message: "Registration approved" });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Officer reject
+app.patch("/api/registrations/:id/reject", authenticate, async (req, res) => {
+  if (req.user.role !== "OFFICER") return res.status(403).json({ success: false, error: "Officers only" });
+  const { reason } = req.body;
+
+  try {
+    await db.query(
+      `UPDATE registrations SET status='REJECTED', rejection_reason=$1, updated_at=NOW() WHERE registration_id=$2`,
+      [reason || "Rejected by officer", req.params.id]
+    );
+
+    await audit("REGISTRATION_REJECTED", req.user.nationalId, "OFFICER", "registration", req.params.id, { reason }, req.ip);
+    res.json({ success: true, message: "Registration rejected" });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+// AUDIT LOG ROUTE
+// ══════════════════════════════════════════════════════════════
+app.get("/api/audit-logs", authenticate, async (req, res) => {
+  if (req.user.role !== "OFFICER") return res.status(403).json({ success: false, error: "Officers only" });
+  try {
+    const result = await db.query(
+      `SELECT * FROM audit_logs ORDER BY timestamp DESC LIMIT 50`
+    );
+    res.json({ success: true, logs: result.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+// START SERVER
+// ══════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════
+// X-ROAD CLEARANCE ENDPOINTS
+// ══════════════════════════════════════════════════════════════
+app.post("/api/clearance/cid", async (req, res) => {
+  const { nationalId } = req.body;
+  const token = jwt.sign({ type: "CID", status: "CLEAR", nationalId, iss: "TEST/GOV/CID" }, "xroad-secret", { expiresIn: "1h" });
+  res.json({ status: "CLEAR", clearanceType: "CID", signedToken: token, issuedBy: "TEST/GOV/CID/SecurityServer", checkedAt: new Date().toISOString() });
+});
+
+app.post("/api/clearance/interpol", async (req, res) => {
+  const { vin, engineNumber } = req.body;
+  const token = jwt.sign({ type: "INTERPOL", status: "CLEAR", vin, iss: "TEST/GOV/INTERPOL" }, "xroad-secret", { expiresIn: "1h" });
+  res.json({ status: "CLEAR", clearanceType: "INTERPOL", signedToken: token, issuedBy: "TEST/GOV/INTERPOL/SecurityServer", checkedAt: new Date().toISOString() });
+});
+
+app.post("/api/clearance/lra", async (req, res) => {
+  const { nationalId } = req.body;
+  const token = jwt.sign({ type: "LRA", status: "CLEAR", nationalId, iss: "TEST/GOV/LRA" }, "xroad-secret", { expiresIn: "1h" });
+  res.json({ status: "CLEAR", clearanceType: "LRA", signedToken: token, issuedBy: "TEST/GOV/LRA/SecurityServer", checkedAt: new Date().toISOString() });
+});
+
+
+// ══ PERMITS ══
+const PERMIT_FEES = { A:150, B:200, C:250, D:300, E:350, F:400 };
+const PERMIT_DESC = { A:"Private Motor Vehicle", B:"Light Commercial (up to 3.5t)", C:"Heavy Commercial (3.5t-16t)", D:"Extra Heavy Commercial (over 16t)", E:"Public Service Vehicle (Taxi/Bus)", F:"Special Purpose Vehicle" };
+
+app.post("/api/permits", authenticate, async (req, res) => {
+  const { vehicleId, permitType } = req.body;
+  const { citizenId, nationalId } = req.user;
+  if (!PERMIT_FEES[permitType]) return res.status(400).json({ success:false, error:"Invalid permit type. Must be A-F." });
+  if (!vehicleId) return res.status(400).json({ success:false, error:"Vehicle ID required." });
+  try {
+    const regCheck = await db.query(
+      "SELECT r.registration_id FROM registrations r JOIN citizens c ON c.citizen_id=r.owner_id WHERE r.vehicle_id=$1 AND r.status='APPROVED' AND c.national_id=$2",
+      [vehicleId, nationalId]
+    );
+    if (regCheck.rows.length === 0) return res.status(400).json({ success:false, error:"Vehicle must have approved registration first." });
+    await db.query("UPDATE permits SET status='EXPIRED', end_date=NOW() WHERE vehicle_id=$1 AND owner_id=$2 AND permit_type=$3 AND status='ACTIVE'", [vehicleId, citizenId, permitType]);
+    const issueDate = new Date().toISOString().split('T')[0];
+    const exp = new Date(); exp.setFullYear(exp.getFullYear()+1);
+    const expiryDate = exp.toISOString().split('T')[0];
+    const result = await db.query(
+      "INSERT INTO permits (vehicle_id,owner_id,permit_type,issue_date,expiry_date,fee_amount,status) VALUES ($1,$2,$3,$4,$5,$6,'PENDING_APPROVAL') RETURNING permit_id",
+      [vehicleId, citizenId, permitType, issueDate, expiryDate, PERMIT_FEES[permitType]]
+    );
+    await db.query("INSERT INTO audit_logs (action,actor_id,actor_role,entity_type,entity_id,details,ip_address) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+      ["PERMIT_APPLIED", nationalId, "CITIZEN", "permit", result.rows[0].permit_id, JSON.stringify({vehicleId,permitType}), req.ip]);
+    res.json({ success:true, permitId:result.rows[0].permit_id, permitType, description:PERMIT_DESC[permitType], issueDate, expiryDate, fee:PERMIT_FEES[permitType], status:"PENDING_APPROVAL", message:"Permit application submitted. Awaiting officer approval." });
+  } catch(err) { res.status(500).json({ success:false, error:err.message }); }
+});
+
+app.get("/api/permits", authenticate, async (req, res) => {
+  try {
+    const result = await db.query(
+      "SELECT p.*, v.model, v.vin, v.manufacture_year FROM permits p JOIN vehicles v ON v.vehicle_id=p.vehicle_id JOIN citizens c ON c.citizen_id=p.owner_id WHERE c.national_id=$1 ORDER BY p.created_at DESC",
+      [req.user.nationalId]
+    );
+    res.json({ success:true, permits:result.rows });
+  } catch(err) { res.status(500).json({ success:false, error:err.message }); }
+});
+
+app.get("/api/permits/pending", authenticate, async (req, res) => {
+  if (req.user.role !== "OFFICER") return res.status(403).json({ success:false, error:"Officers only" });
+  try {
+    const result = await db.query(
+      "SELECT p.*, v.model, v.vin, v.manufacture_year, v.vehicle_type, c.full_name as owner_name, c.national_id as owner_national_id FROM permits p JOIN vehicles v ON v.vehicle_id=p.vehicle_id JOIN citizens c ON c.citizen_id=p.owner_id WHERE p.status='PENDING_APPROVAL' ORDER BY p.created_at ASC"
+    );
+    res.json({ success:true, permits:result.rows });
+  } catch(err) { res.status(500).json({ success:false, error:err.message }); }
+});
+
+app.patch("/api/permits/:id/approve", authenticate, async (req, res) => {
+  if (req.user.role !== "OFFICER") return res.status(403).json({ success:false, error:"Officers only" });
+  try {
+    const result = await db.query("UPDATE permits SET status='ACTIVE' WHERE permit_id=$1 AND status='PENDING_APPROVAL' RETURNING *", [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ success:false, error:"Permit not found or already processed." });
+    await db.query("INSERT INTO audit_logs (action,actor_id,actor_role,entity_type,entity_id,details,ip_address) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+      ["PERMIT_APPROVED", req.user.nationalId, "OFFICER", "permit", req.params.id, "{}", req.ip]);
+    res.json({ success:true, message:"Permit approved successfully." });
+  } catch(err) { res.status(500).json({ success:false, error:err.message }); }
+});
+
+app.patch("/api/permits/:id/reject", authenticate, async (req, res) => {
+  if (req.user.role !== "OFFICER") return res.status(403).json({ success:false, error:"Officers only" });
+  try {
+    const result = await db.query("UPDATE permits SET status='REJECTED' WHERE permit_id=$1 AND status='PENDING_APPROVAL' RETURNING *", [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ success:false, error:"Permit not found or already processed." });
+    await db.query("INSERT INTO audit_logs (action,actor_id,actor_role,entity_type,entity_id,details,ip_address) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+      ["PERMIT_REJECTED", req.user.nationalId, "OFFICER", "permit", req.params.id, JSON.stringify({reason:req.body.reason}), req.ip]);
+    res.json({ success:true, message:"Permit rejected." });
+  } catch(err) { res.status(500).json({ success:false, error:err.message }); }
+});
+
+// ══ TRANSFERS ══
+app.post("/api/transfers", authenticate, async (req, res) => {
+  const { vehicleId, newOwnerNationalId, transferType } = req.body;
+  const { nationalId, citizenId } = req.user;
+  if (!vehicleId || !newOwnerNationalId) return res.status(400).json({ success:false, error:"Vehicle ID and new owner National ID required." });
+  if (nationalId === newOwnerNationalId) return res.status(400).json({ success:false, error:"Cannot transfer vehicle to yourself." });
+  try {
+    const newOwnerResult = await db.query("SELECT citizen_id, full_name FROM citizens WHERE national_id=$1", [newOwnerNationalId]);
+    if (newOwnerResult.rows.length === 0) return res.status(404).json({ success:false, error:"New owner not found. They must log into DVRS first." });
+    const newOwner = newOwnerResult.rows[0];
+    const ownerCheck = await db.query(
+      "SELECT o.ownership_id FROM ownership o JOIN citizens c ON c.citizen_id=o.owner_id WHERE o.vehicle_id=$1 AND c.national_id=$2 AND o.end_date IS NULL AND o.status='APPROVED'",
+      [vehicleId, nationalId]
+    );
+    if (ownerCheck.rows.length === 0) return res.status(403).json({ success:false, error:"You do not own this vehicle." });
+    const pendingCheck = await db.query("SELECT ownership_id FROM ownership WHERE vehicle_id=$1 AND status='PENDING_APPROVAL'", [vehicleId]);
+    if (pendingCheck.rows.length > 0) return res.status(400).json({ success:false, error:"A transfer request for this vehicle is already pending approval." });
+    const result = await db.query(
+      "INSERT INTO ownership (vehicle_id,owner_id,start_date,transfer_type,status) VALUES ($1,$2,NOW(),$3,'PENDING_APPROVAL') RETURNING ownership_id",
+      [vehicleId, newOwner.citizen_id, transferType || "PURCHASE"]
+    );
+    await db.query("INSERT INTO audit_logs (action,actor_id,actor_role,entity_type,entity_id,details,ip_address) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+      ["TRANSFER_REQUESTED", nationalId, "CITIZEN", "ownership", result.rows[0].ownership_id,
+       JSON.stringify({vehicleId, to:newOwnerNationalId, newOwnerName:newOwner.full_name}), req.ip]);
+    res.json({ success:true, transferId:result.rows[0].ownership_id, newOwnerName:newOwner.full_name, status:"PENDING_APPROVAL", message:"Transfer request submitted. Awaiting officer approval." });
+  } catch(err) { res.status(500).json({ success:false, error:err.message }); }
+});
+
+app.get("/api/vehicles/my", authenticate, async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT DISTINCT v.*, r.registration_number, r.status as reg_status, r.registration_id,
+              o.ownership_id, o.start_date as owned_since
+       FROM vehicles v
+       JOIN registrations r ON r.vehicle_id = v.vehicle_id
+       JOIN citizens c ON c.citizen_id = r.owner_id
+       LEFT JOIN ownership o ON o.vehicle_id = v.vehicle_id AND o.owner_id = c.citizen_id
+       WHERE c.national_id = $1
+         AND r.status IN ('APPROVED','AWAITING_REVIEW','PENDING')
+       ORDER BY v.created_at DESC`,
+      [req.user.nationalId]
+    );
+    res.json({ success:true, vehicles:result.rows });
+  } catch(err) { res.status(500).json({ success:false, error:err.message }); }
+});
+
+app.get("/api/transfers/pending", authenticate, async (req, res) => {
+  if (req.user.role !== "OFFICER") return res.status(403).json({ success:false, error:"Officers only" });
+  try {
+    const result = await db.query(
+      "SELECT o_new.ownership_id, o_new.transfer_type, o_new.start_date as requested_at, v.vehicle_id, v.model, v.vin, v.manufacture_year, c_new.full_name as new_owner_name, c_new.national_id as new_owner_national_id, c_old.full_name as current_owner_name, c_old.national_id as current_owner_national_id, r.registration_number FROM ownership o_new JOIN vehicles v ON v.vehicle_id=o_new.vehicle_id JOIN citizens c_new ON c_new.citizen_id=o_new.owner_id LEFT JOIN ownership o_old ON o_old.vehicle_id=o_new.vehicle_id AND o_old.end_date IS NULL AND o_old.status='APPROVED' LEFT JOIN citizens c_old ON c_old.citizen_id=o_old.owner_id LEFT JOIN registrations r ON r.vehicle_id=o_new.vehicle_id AND r.status='APPROVED' WHERE o_new.status='PENDING_APPROVAL' ORDER BY o_new.start_date ASC"
+    );
+    res.json({ success:true, transfers:result.rows });
+  } catch(err) { res.status(500).json({ success:false, error:err.message }); }
+});
+
+app.patch("/api/transfers/:id/approve", authenticate, async (req, res) => {
+  if (req.user.role !== "OFFICER") return res.status(403).json({ success:false, error:"Officers only" });
+  try {
+    const transfer = await db.query("SELECT * FROM ownership WHERE ownership_id=$1 AND status='PENDING_APPROVAL'", [req.params.id]);
+    if (transfer.rows.length === 0) return res.status(404).json({ success:false, error:"Transfer not found or already processed." });
+    const { vehicle_id, owner_id } = transfer.rows[0];
+    await db.query("UPDATE ownership SET end_date=NOW(), status='CLOSED' WHERE vehicle_id=$1 AND end_date IS NULL AND status='APPROVED'", [vehicle_id]);
+    await db.query("UPDATE ownership SET status='APPROVED' WHERE ownership_id=$1", [req.params.id]);
+    await db.query("UPDATE registrations SET owner_id=$1, updated_at=NOW() WHERE vehicle_id=$2 AND status='APPROVED'", [owner_id, vehicle_id]);
+    await db.query("INSERT INTO audit_logs (action,actor_id,actor_role,entity_type,entity_id,details,ip_address) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+      ["TRANSFER_APPROVED", req.user.nationalId, "OFFICER", "ownership", req.params.id, "{}", req.ip]);
+    res.json({ success:true, message:"Ownership transfer approved successfully." });
+  } catch(err) { res.status(500).json({ success:false, error:err.message }); }
+});
+
+app.patch("/api/transfers/:id/reject", authenticate, async (req, res) => {
+  if (req.user.role !== "OFFICER") return res.status(403).json({ success:false, error:"Officers only" });
+  try {
+    const result = await db.query("UPDATE ownership SET status='REJECTED' WHERE ownership_id=$1 AND status='PENDING_APPROVAL' RETURNING *", [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ success:false, error:"Transfer not found or already processed." });
+    await db.query("INSERT INTO audit_logs (action,actor_id,actor_role,entity_type,entity_id,details,ip_address) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+      ["TRANSFER_REJECTED", req.user.nationalId, "OFFICER", "ownership", req.params.id, JSON.stringify({reason:req.body.reason}), req.ip]);
+    res.json({ success:true, message:"Transfer rejected." });
+  } catch(err) { res.status(500).json({ success:false, error:err.message }); }
+});
+
+
+// Retry clearances for stuck PENDING registrations
+app.post("/api/registrations/:id/retry", authenticate, async (req, res) => {
+  const { nationalId, citizenId } = req.user;
+  const { id } = req.params;
+  try {
+    // Verify this registration belongs to this citizen
+    const reg = await db.query(
+      "SELECT r.*, v.vin, v.engine_number FROM registrations r JOIN vehicles v ON v.vehicle_id=r.vehicle_id JOIN citizens c ON c.citizen_id=r.owner_id WHERE r.registration_id=$1 AND c.national_id=$2 AND r.status='PENDING'",
+      [id, nationalId]
+    );
+    if (reg.rows.length === 0) return res.status(404).json({ success:false, error:"Registration not found or not in PENDING status." });
+    const { vin, engine_number } = reg.rows[0];
+
+    // Reset clearances to PENDING
+    await db.query("UPDATE clearances SET status='PENDING', received_at=NULL, error_message=NULL WHERE registration_id=$1", [id]);
+
+    res.json({ success:true, message:"Clearances retrying. Check back in a few seconds." });
+
+    // Re-trigger clearances in background
+    (async () => {
+      try {
+        const [cidResult, interpolResult, lraResult] = await Promise.all([
+          requestXRoadClearance("cid",     { nationalId }),
+          requestXRoadClearance("interpol",{ vin, engineNumber: engine_number }),
+          requestXRoadClearance("lra",     { nationalId }),
+        ]);
+        await db.query("UPDATE clearances SET status=$1,signed_token=$2,issued_by=$3,received_at=NOW() WHERE registration_id=$4 AND clearance_type='CID'",
+          [cidResult.status, cidResult.signedToken, cidResult.issuedBy, id]);
+        await db.query("UPDATE clearances SET status=$1,signed_token=$2,issued_by=$3,received_at=NOW() WHERE registration_id=$4 AND clearance_type='INTERPOL'",
+          [interpolResult.status, interpolResult.signedToken, interpolResult.issuedBy, id]);
+        await db.query("UPDATE clearances SET status=$1,signed_token=$2,issued_by=$3,received_at=NOW() WHERE registration_id=$4 AND clearance_type='LRA'",
+          [lraResult.status, lraResult.signedToken, lraResult.issuedBy, id]);
+        await db.query("UPDATE registrations SET status='AWAITING_REVIEW', updated_at=NOW() WHERE registration_id=$1", [id]);
+      } catch(e) { console.error("Retry clearances error:", e.message); }
+    })();
+  } catch(err) { res.status(500).json({ success:false, error:err.message }); }
+});
+
+
+// Get single pending registration for editing
+app.get("/api/registrations/:id/edit", authenticate, async (req, res) => {
+  const { nationalId } = req.user;
+  try {
+    const result = await db.query(
+      `SELECT r.registration_id, r.registration_category, r.fee_amount, r.status,
+              v.vehicle_id, v.vin, v.engine_number, v.chassis_number, v.vehicle_type,
+              v.manufacturer, v.model, v.manufacture_year, v.tare_weight_kg, v.color
+       FROM registrations r
+       JOIN vehicles v ON v.vehicle_id = r.vehicle_id
+       JOIN citizens c ON c.citizen_id = r.owner_id
+       WHERE r.registration_id = $1 AND c.national_id = $2 AND r.status = 'PENDING'`,
+      [req.params.id, nationalId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ success:false, error:"Registration not found or not editable." });
+    res.json({ success:true, registration: result.rows[0] });
+  } catch(err) { res.status(500).json({ success:false, error:err.message }); }
+});
+
+// Update a pending registration (citizen edits and resubmits)
+app.patch("/api/registrations/:id/edit", authenticate, async (req, res) => {
+  const { nationalId, citizenId } = req.user;
+  const { vehicleDetails, category } = req.body;
+  try {
+    // Verify ownership and PENDING status
+    const reg = await db.query(
+      `SELECT r.registration_id, r.vehicle_id FROM registrations r
+       JOIN citizens c ON c.citizen_id = r.owner_id
+       WHERE r.registration_id = $1 AND c.national_id = $2 AND r.status = 'PENDING'`,
+      [req.params.id, nationalId]
+    );
+    if (reg.rows.length === 0) return res.status(404).json({ success:false, error:"Registration not found or not editable." });
+    const { vehicle_id, registration_id } = reg.rows[0];
+
+    // Update vehicle details
+    await db.query(
+      `UPDATE vehicles SET
+         vin=$1, engine_number=$2, chassis_number=$3, vehicle_type=$4,
+         manufacturer=$5, model=$6, manufacture_year=$7, tare_weight_kg=$8, color=$9
+       WHERE vehicle_id=$10`,
+      [vehicleDetails.vin, vehicleDetails.engineNumber, vehicleDetails.chassis,
+       vehicleDetails.vehicleType, vehicleDetails.make?.split(" ")[0],
+       vehicleDetails.make, parseInt(vehicleDetails.year),
+       parseInt(vehicleDetails.weight), vehicleDetails.color, vehicle_id]
+    );
+
+    // Recalculate fee
+    const w = parseInt(vehicleDetails.weight) || 0;
+    let fee = 150;
+    if (w <= 1500) fee = 150;
+    else if (w <= 3500) fee = 250;
+    else if (w <= 6500) fee = 350;
+    else if (w <= 9500) fee = 400;
+    else if (w <= 11000) fee = 310;
+    else fee = 360;
+
+    // Update registration category and fee
+    await db.query(
+      `UPDATE registrations SET registration_category=$1, fee_amount=$2, updated_at=NOW() WHERE registration_id=$3`,
+      [category || reg.rows[0].registration_category, fee, registration_id]
+    );
+
+    // Reset clearances
+    await db.query(
+      `UPDATE clearances SET status='PENDING', received_at=NULL, error_message=NULL WHERE registration_id=$1`,
+      [registration_id]
+    );
+
+    await db.query(
+      `INSERT INTO audit_logs (action,actor_id,actor_role,entity_type,entity_id,details,ip_address)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      ["REGISTRATION_EDITED", nationalId, "CITIZEN", "registration", registration_id,
+       JSON.stringify({ vehicleDetails, category }), req.ip]
+    );
+
+    res.json({ success:true, registrationId: registration_id, message:"Registration updated. Retrying clearances." });
+
+    // Re-trigger clearances in background
+    (async () => {
+      try {
+        const [cidR, intR, lraR] = await Promise.all([
+          requestXRoadClearance("cid",      { nationalId }),
+          requestXRoadClearance("interpol", { vin: vehicleDetails.vin, engineNumber: vehicleDetails.engineNumber }),
+          requestXRoadClearance("lra",      { nationalId }),
+        ]);
+        await db.query("UPDATE clearances SET status=$1,signed_token=$2,issued_by=$3,received_at=NOW() WHERE registration_id=$4 AND clearance_type='CID'",
+          [cidR.status, cidR.signedToken, cidR.issuedBy, registration_id]);
+        await db.query("UPDATE clearances SET status=$1,signed_token=$2,issued_by=$3,received_at=NOW() WHERE registration_id=$4 AND clearance_type='INTERPOL'",
+          [intR.status, intR.signedToken, intR.issuedBy, registration_id]);
+        await db.query("UPDATE clearances SET status=$1,signed_token=$2,issued_by=$3,received_at=NOW() WHERE registration_id=$4 AND clearance_type='LRA'",
+          [lraR.status, lraR.signedToken, lraR.issuedBy, registration_id]);
+        await db.query("UPDATE registrations SET status='AWAITING_REVIEW', updated_at=NOW() WHERE registration_id=$1", [registration_id]);
+        console.log("Clearances completed for edited registration:", registration_id);
+      } catch(e) { console.error("Edit clearances error:", e.message); }
+    })();
+  } catch(err) { res.status(500).json({ success:false, error:err.message }); }
+});
+
+
+// ══════════════════════════════════════════════════════════════
+// DRAFT REGISTRATION — SAVE, RESUME, DELETE
+// ══════════════════════════════════════════════════════════════
+
+// Save or update a draft registration
+app.post("/api/registrations/draft", authenticate, async (req, res) => {
+  const { draftId, step, formData } = req.body;
+  const citizenId = req.user.citizenId || null;
+  const nationalId = req.user.nationalId;
+
+  try {
+    if (draftId) {
+      const result = await db.query(
+        `WITH me AS (
+           SELECT COALESCE($4::uuid, (
+             SELECT citizen_id FROM citizens WHERE national_id = $5 LIMIT 1
+           )) AS citizen_id
+         )
+         UPDATE registrations
+         SET draft_data = $1::jsonb,
+             current_step = $2,
+             updated_at = NOW()
+         WHERE registration_id = $3
+           AND owner_id = (SELECT citizen_id FROM me)
+           AND is_draft = true
+         RETURNING registration_id, current_step, draft_data`,
+        [JSON.stringify(formData || {}), step || 1, draftId, citizenId, nationalId]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({ success: false, error: "Draft not found" });
+      }
+
+      return res.json({
+        success: true,
+        draftId: result.rows[0].registration_id,
+        step: result.rows[0].current_step,
+      });
+    }
+
+    const result = await db.query(
+      `WITH me AS (
+         SELECT COALESCE($1::uuid, (
+           SELECT citizen_id FROM citizens WHERE national_id = $2 LIMIT 1
+         )) AS citizen_id
+       )
+       INSERT INTO registrations (owner_id, is_draft, draft_data, current_step, status)
+       SELECT citizen_id, true, $3::jsonb, $4, 'DRAFT'
+       FROM me
+       WHERE citizen_id IS NOT NULL
+       RETURNING registration_id`,
+      [citizenId, nationalId, JSON.stringify(formData || {}), step || 1]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: "Citizen not found for draft save" });
+    }
+
+    return res.json({
+      success: true,
+      draftId: result.rows[0].registration_id,
+      step: step || 1,
+    });
+  } catch (err) {
+    console.error("Draft save error:", err.message);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Get citizen's active draft
+app.get("/api/registrations/draft", authenticate, async (req, res) => {
+  const citizenId = req.user.citizenId || null;
+  const nationalId = req.user.nationalId;
+
+  try {
+    const result = await db.query(
+      `WITH me AS (
+         SELECT COALESCE($1::uuid, (
+           SELECT citizen_id FROM citizens WHERE national_id = $2 LIMIT 1
+         )) AS citizen_id
+       )
+       SELECT registration_id, current_step, draft_data, created_at, updated_at
+       FROM registrations
+       WHERE owner_id = (SELECT citizen_id FROM me)
+         AND is_draft = true
+         AND status = 'DRAFT'
+       ORDER BY updated_at DESC
+       LIMIT 1`,
+      [citizenId, nationalId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.json({ success: true, draft: null });
+    }
+
+    const draft = result.rows[0];
+    return res.json({
+      success: true,
+      draft: {
+        draftId: draft.registration_id,
+        step: draft.current_step,
+        formData: draft.draft_data,
+        savedAt: draft.updated_at,
+      },
+    });
+  } catch (err) {
+    console.error("Draft fetch error:", err.message);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Delete a draft
+app.delete("/api/registrations/draft/:id", authenticate, async (req, res) => {
+  const citizenId = req.user.citizenId || null;
+  const nationalId = req.user.nationalId;
+
+  try {
+    await db.query(
+      `WITH me AS (
+         SELECT COALESCE($1::uuid, (
+           SELECT citizen_id FROM citizens WHERE national_id = $2 LIMIT 1
+         )) AS citizen_id
+       )
+       DELETE FROM registrations
+       WHERE registration_id = $3
+         AND owner_id = (SELECT citizen_id FROM me)
+         AND is_draft = true`,
+      [citizenId, nationalId, req.params.id]
+    );
+
+    return res.json({ success: true, message: "Draft deleted" });
+  } catch (err) {
+    console.error("Draft delete error:", err.message);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Start backend after all routes are registered
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`\n🚗 DVRS Backend running on http://0.0.0.0:${PORT}`);
+  console.log(`📋 Health:       http://0.0.0.0:${PORT}/api/health`);
+  console.log(`🔐 MOSIP login:  http://0.0.0.0:${PORT}/api/auth/mosip/login`);
+  console.log(`🔍 Registrations:http://0.0.0.0:${PORT}/api/registrations\n`);
+});

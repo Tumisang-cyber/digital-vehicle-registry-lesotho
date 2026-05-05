@@ -1,0 +1,100 @@
+nohup: ignoring input
+◇ injected env (16) from .env // tip: ⌁ auth for agents [www.vestauth.com]
+
+🚗 DVRS Backend running on http://127.0.0.1:5000
+📋 Health:       http://127.0.0.1:5000/api/health
+🔐 MOSIP login:  http://127.0.0.1:5000/api/auth/mosip/login
+🔍 Registrations:http://127.0.0.1:5000/api/registrations
+
+✅ PostgreSQL connected
+[0mGET /api/health [32m200[0m 74.073 ms - 102[0m
+[0mGET /api/auth/mosip/login [32m200[0m 20.427 ms - 362[0m
+[0mGET /api/auth/mosip/login [32m200[0m 3.186 ms - 362[0m
+[0mGET /api/auth/mosip/login [32m200[0m 3.970 ms - 362[0m
+[0mGET /api/registrations [32m200[0m 95.635 ms - 13685[0m
+[0mGET /api/registrations [32m200[0m 20.777 ms - 13685[0m
+[0mGET /api/permits/pending [32m200[0m 15.620 ms - 507[0m
+[0mGET /api/permits/pending [32m200[0m 7.703 ms - 507[0m
+[0mGET /api/transfers/pending [32m200[0m 16.667 ms - 475[0m
+[0mGET /api/transfers/pending [32m200[0m 9.009 ms - 475[0m
+[0mGET /api/audit-logs [32m200[0m 18.572 ms - 17334[0m
+[0mGET /api/audit-logs [32m200[0m 11.616 ms - 17334[0m
+[0mGET /api/auth/mosip/login [32m200[0m 9.022 ms - 362[0m
+[0mGET /api/auth/mosip/login [32m200[0m 3.134 ms - 362[0m
+[0mGET /api/auth/mosip/login [32m200[0m 12.920 ms - 362[0m
+[0mGET /api/registrations [32m200[0m 86.532 ms - 13685[0m
+[0mGET /api/registrations [32m200[0m 22.744 ms - 13685[0m
+[0mGET /api/permits/pending [32m200[0m 8.829 ms - 507[0m
+[0mGET /api/permits/pending [32m200[0m 5.212 ms - 507[0m
+[0mGET /api/transfers/pending [32m200[0m 26.740 ms - 475[0m
+[0mGET /api/transfers/pending [32m200[0m 10.583 ms - 475[0m
+[0mGET /api/audit-logs [32m200[0m 17.697 ms - 17334[0m
+[0mGET /api/audit-logs [32m200[0m 15.575 ms - 17334[0m
+[0mGET /api/auth/mosip/login [32m200[0m 2.474 ms - 362[0m
+[0mGET /api/auth/mosip/login [32m200[0m 0.701 ms - 362[0m
+[0mGET /api/auth/mosip/callback?error_description=The+transaction+has+expired.+Please+try+again.&state=4dc9d9462d4df1d7894e71c50b4bd84a&error=invalid_transaction [36m302[0m 11.300 ms - 121[0m
+[0mGET /api/auth/mosip/login [32m200[0m 1.025 ms - 362[0m
+[0mGET /api/registrations [32m200[0m 13.685 ms - 13685[0m
+[0mGET /api/registrations [32m200[0m 3.416 ms - 13685[0m
+[0mGET /api/permits/pending [32m200[0m 2.371 ms - 507[0m
+[0mGET /api/permits/pending [32m200[0m 1.323 ms - 507[0m
+[0mGET /api/transfers/pending [32m200[0m 2.007 ms - 475[0m
+[0mGET /api/transfers/pending [32m200[0m 1.658 ms - 475[0m
+[0mGET /api/audit-logs [32m200[0m 3.011 ms - 17334[0m
+[0mGET /api/audit-logs [32m200[0m 2.418 ms - 17334[0m
+[0mGET /api/registrations [32m200[0m 3.503 ms - 13685[0m
+[0mGET /api/registrations [32m200[0m 3.869 ms - 13685[0m
+[0mGET /api/permits/pending [32m200[0m 2.324 ms - 507[0m
+[0mGET /api/permits/pending [32m200[0m 1.745 ms - 507[0m
+[0mGET /api/transfers/pending [32m200[0m 2.473 ms - 475[0m
+[0mGET /api/transfers/pending [32m200[0m 2.407 ms - 475[0m
+[0mGET /api/audit-logs [32m200[0m 2.838 ms - 17334[0m
+[0mGET /api/audit-logs [32m200[0m 2.906 ms - 17334[0m
+[0mGET /api/auth/mosip/login [32m200[0m 0.666 ms - 362[0m
+[0mGET /api/auth/mosip/login [32m200[0m 0.421 ms - 362[0m
+[0mGET /api/registrations [32m200[0m 12.931 ms - 13685[0m
+[0mGET /api/registrations [32m200[0m 11.842 ms - 13685[0m
+[0mGET /api/permits/pending [32m200[0m 1.417 ms - 507[0m
+[0mGET /api/permits/pending [32m200[0m 0.995 ms - 507[0m
+[0mGET /api/transfers/pending [32m200[0m 2.086 ms - 475[0m
+[0mGET /api/transfers/pending [32m200[0m 2.303 ms - 475[0m
+[0mGET /api/audit-logs [32m200[0m 2.362 ms - 17334[0m
+[0mGET /api/audit-logs [32m200[0m 2.305 ms - 17334[0m
+[0mGET /api/registrations [32m200[0m 2.287 ms - 13685[0m
+[0mGET /api/registrations [32m200[0m 2.402 ms - 13685[0m
+[0mGET /api/permits/pending [32m200[0m 1.467 ms - 507[0m
+[0mGET /api/permits/pending [32m200[0m 1.290 ms - 507[0m
+[0mGET /api/transfers/pending [32m200[0m 1.689 ms - 475[0m
+[0mGET /api/transfers/pending [32m200[0m 2.007 ms - 475[0m
+[0mGET /api/audit-logs [32m200[0m 1.978 ms - 17334[0m
+[0mGET /api/audit-logs [32m200[0m 1.495 ms - 17334[0m
+[0mGET /api/auth/mosip/login [32m200[0m 0.589 ms - 362[0m
+[0mGET /api/auth/mosip/login [32m200[0m 6.713 ms - 362[0m
+[0mGET /api/auth/mosip/login [32m200[0m 11.392 ms - 362[0m
+[0mGET /api/auth/mosip/callback?error_description=The+transaction+has+expired.+Please+try+again.&state=47bc86a1c4a6fb2ca5ab638824151cba&error=invalid_transaction [36m302[0m 3.755 ms - 121[0m
+[0mGET /api/auth/mosip/login [32m200[0m 0.445 ms - 362[0m
+✅ MOSIP auth success: WrlG-oPl6KKxTSgf2lfe96E8EScwBs-BgA_L6J5nRik
+[0mGET /api/auth/mosip/callback?state=7b804459c5dce9be8dc0b17f2b0e69a9&code=Mqfz6ZA4KPXUpGNT42eWfMwPTx_YCZ9g5WQIBdrDpSM&iss=http%3A%2F%2Flocalhost%3A8088&ui_locales=en [36m302[0m 371.674 ms - 449[0m
+[0mGET /api/registrations [32m200[0m 17.699 ms - 4243[0m
+[0mGET /api/registrations/draft [32m200[0m 25.475 ms - 29[0m
+[0mGET /api/registrations [32m200[0m 29.543 ms - 4243[0m
+[0mGET /api/vehicles/my [32m200[0m 22.444 ms - 3867[0m
+[0mGET /api/registrations/draft [32m200[0m 25.584 ms - 29[0m
+[0mGET /api/vehicles/my [32m200[0m 22.586 ms - 3867[0m
+[0mGET /api/vehicles/my [32m200[0m 16.204 ms - 3867[0m
+[0mGET /api/vehicles/my [32m200[0m 15.495 ms - 3867[0m
+[0mGET /api/vehicles/my [32m200[0m 27.635 ms - 3867[0m
+[0mGET /api/registrations [32m200[0m 32.684 ms - 4243[0m
+[0mGET /api/registrations [32m200[0m 22.208 ms - 4243[0m
+[0mGET /api/registrations/draft [32m200[0m 21.349 ms - 29[0m
+[0mGET /api/registrations/draft [32m200[0m 28.563 ms - 29[0m
+[0mGET /api/vehicles/my [32m200[0m 24.335 ms - 3867[0m
+[0mGET /api/auth/mosip/login [32m200[0m 0.542 ms - 362[0m
+✅ MOSIP auth success: DfKE5zd-pbp3hE9kdho8ZKoC60vHSs95SK-Fa9jY0Fo
+[0mGET /api/auth/mosip/callback?state=e59f17eada87920187a701c61592c9b1&code=xuXRWKsUzUu3D8b-Upspzp1pxYpzrm2zkSZwJfqhIug&iss=http%3A%2F%2Flocalhost%3A8088&ui_locales=en [36m302[0m 81.648 ms - 449[0m
+[0mGET /api/registrations [32m200[0m 11.530 ms - 2045[0m
+[0mGET /api/vehicles/my [32m200[0m 16.246 ms - 1962[0m
+[0mGET /api/registrations/draft [32m200[0m 46.524 ms - 29[0m
+[0mGET /api/registrations/draft [32m200[0m 32.455 ms - 29[0m
+[0mGET /api/registrations [32m200[0m 29.492 ms - 2045[0m
+[0mGET /api/vehicles/my [32m200[0m 40.132 ms - 1962[0m
